@@ -35,3 +35,12 @@ jobs:
           path: debug-screenshots/
           if-no-files-found: ignore
           retention-days: 3
+
+      - name: Upload debug data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-data
+          path: debug-data/
+          if-no-files-found: ignore
+          retention-days: 3
