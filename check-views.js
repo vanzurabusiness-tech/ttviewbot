@@ -38,7 +38,9 @@ async function sendTelegram(text){
 async function getTrackedVideoLinks(){
   const doc = await db.collection('trackers').doc(UID).get();
   if(!doc.exists) return [];
-  return doc.data().trackedVideoLinks || [];
+  const raw = doc.data().trackedVideoLinks || [];
+  // Entries may be plain strings (old data) or { url, addedAt } objects (new data).
+  return raw.map(entry => typeof entry === 'string' ? entry : entry.url);
 }
 
 function extractVideoId(url){
