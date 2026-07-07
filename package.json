@@ -1,0 +1,13 @@
+{
+  "name": "tiktok-view-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scrapes public TikTok profiles for view counts and notifies Telegram at view milestones.",
+  "scripts": {
+    "check": "node check-views.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.12.1",
+    "firebase-admin": "^12.2.0"
+  }
+}
