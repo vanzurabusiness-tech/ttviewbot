@@ -1,14 +1,16 @@
 // check-views.js
-// Scrapes public TikTok profiles for their videos' view counts,
-// and sends a Telegram message the first time a video crosses each milestone.
+// Checks specific TikTok video links (that you paste into the app's "Tracked videos"
+// panel) for their view counts, and sends a Telegram message the first time a video
+// crosses each milestone.
 //
-// Tracked profiles and results now live in the same Firestore project as the
-// account tracker web app, scoped under your Firebase Auth UID.
+// Tracked links and results live in the same Firestore project as the account
+// tracker web app, scoped under your Firebase Auth UID.
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const admin = require('firebase-admin');
+const fs = require('fs');
 
 const MILESTONES = [500, 1000, 5000, 10000];
 const UID = process.env.FIRESTORE_UID;
@@ -35,15 +37,20 @@ async function sendTelegram(text){
   }
 }
 
-async function getTrackedProfiles(){
+async function getTrackedVideoLinks(){
   const doc = await db.collection('trackers').doc(UID).get();
   if(!doc.exists) return [];
-  return doc.data().trackedProfiles || [];
+  return doc.data().trackedVideoLinks || [];
+}
+
+function extractVideoId(url){
+  const m = url.match(/\/video\/(\d+)/);
+  return m ? m[1] : null;
 }
 
 // Recursively search the page's embedded state for any object that looks like
-// a TikTok video item ({ id, stats.playCount, author }). This is deliberately
-// loose so small schema changes on TikTok's side don't break it outright.
+// a TikTok video item ({ id, stats.playCount }). Loose on purpose so small
+// schema changes on TikTok's side don't break it outright.
 function findVideoItems(obj, found = new Map(), depth = 0){
   if(!obj || typeof obj !== 'object' || depth > 10) return found;
   if(obj.id && obj.stats && typeof obj.stats.playCount === 'number'){
@@ -57,62 +64,52 @@ function findVideoItems(obj, found = new Map(), depth = 0){
   return found;
 }
 
-async function scrapeProfile(browser, handle){
+async function checkVideo(browser, videoUrl){
+  const videoId = extractVideoId(videoUrl);
+  if(!videoId){
+    console.warn(`Could not parse a video ID out of: ${videoUrl}`);
+    return null;
+  }
+
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
   );
   try{
-    await page.goto(`https://www.tiktok.com/@${handle}`, { waitUntil: 'networkidle2', timeout: 60000 });
-    await wait(3500);
+    await page.goto(videoUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+    await wait(3000);
 
-    // TikTok sometimes shows "Something went wrong / please try again later" on the video
-    // grid specifically (profile info still loads fine). Retry a couple times, clicking
-    // its own Refresh button, before giving up.
-    for(let attempt = 0; attempt < 3; attempt++){
-      const hasError = await page.evaluate(() => document.body.innerText.includes('Something went wrong'));
-      if(!hasError) break;
-
-      console.log(`[@${handle}] Video grid errored (attempt ${attempt + 1}/3) — retrying...`);
-      const clicked = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
-        const refreshBtn = btns.find(b => b.innerText && b.innerText.trim().toLowerCase() === 'refresh');
-        if(refreshBtn){ refreshBtn.click(); return true; }
-        return false;
-      });
-      if(!clicked) await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
-      await wait(4000 + attempt * 2000);
-    }
-
-    const title = await page.title();
-    const finalUrl = page.url();
-    console.log(`[@${handle}] Loaded page title: "${title}" at ${finalUrl}`);
-
-    // Save a screenshot so we can see exactly what the bot saw (CAPTCHA, block page, real content, etc.)
-    try{
-      const fs = require('fs');
-      if(!fs.existsSync('debug-screenshots')) fs.mkdirSync('debug-screenshots');
-      await page.screenshot({ path: `debug-screenshots/${handle}.png`, fullPage: false });
-    }catch(shotErr){
-      console.warn(`[@${handle}] Could not save debug screenshot:`, shotErr.message);
+    const blocked = await page.evaluate(() => {
+      const text = document.body.innerText || '';
+      return text.includes('Something went wrong') || text.includes('Drag the slider') || text.includes('Verify to continue');
+    });
+    if(blocked){
+      console.warn(`[${videoId}] Hit a CAPTCHA / block page — skipping, not attempting to solve it.`);
+      try{
+        if(!fs.existsSync('debug-screenshots')) fs.mkdirSync('debug-screenshots');
+        await page.screenshot({ path: `debug-screenshots/${videoId}.png` });
+      }catch(e){}
+      return null;
     }
 
     const state = await page.evaluate(() => {
       return window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null;
     });
-
     if(!state){
-      console.warn(`[@${handle}] No embedded state found — page structure may have changed, or the profile didn't load.`);
-      return [];
+      console.warn(`[${videoId}] No embedded state found on the page.`);
+      return null;
     }
 
     const items = findVideoItems(state);
-    console.log(`[@${handle}] Embedded state present, found ${items.size} matching video objects in it.`);
-    return Array.from(items.values()).map(v => ({
-      ...v,
-      url: `https://www.tiktok.com/@${handle}/video/${v.id}`
-    }));
+    const match = items.get(videoId) || Array.from(items.values())[0]; // fall back to first item found
+    if(!match){
+      console.warn(`[${videoId}] Page loaded but no matching video stats found in it.`);
+      return null;
+    }
+
+    console.log(`[${videoId}] ${match.playCount.toLocaleString()} views`);
+    return { id: videoId, playCount: match.playCount, url: videoUrl };
   } finally {
     await page.close();
   }
@@ -148,9 +145,9 @@ async function main(){
     process.exit(1);
   }
 
-  const profiles = await getTrackedProfiles();
-  if(profiles.length === 0){
-    console.log('No tracked profiles found in Firestore — add some from the "View Tracker" tab in the app.');
+  const links = await getTrackedVideoLinks();
+  if(links.length === 0){
+    console.log('No tracked video links found in Firestore — add some from the "View Tracker" tab in the app.');
     return;
   }
 
@@ -159,16 +156,13 @@ async function main(){
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
-  for(const handle of profiles){
+  for(const link of links){
     try{
-      console.log(`Checking @${handle}...`);
-      const videos = await scrapeProfile(browser, handle);
-      console.log(`Found ${videos.length} videos for @${handle}`);
-      for(const v of videos){
-        await processVideo(v);
-      }
+      console.log(`Checking ${link}...`);
+      const result = await checkVideo(browser, link);
+      if(result) await processVideo(result);
     }catch(e){
-      console.error(`Error checking @${handle}:`, e.message);
+      console.error(`Error checking ${link}:`, e.message);
     }
   }
 
