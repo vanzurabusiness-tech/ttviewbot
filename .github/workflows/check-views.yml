@@ -26,3 +26,12 @@ jobs:
           FIRESTORE_UID: ${{ secrets.FIRESTORE_UID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug-screenshots/
+          if-no-files-found: ignore
+          retention-days: 3
