@@ -104,9 +104,47 @@ async function checkVideo(browser, videoUrl){
     const debugInfo = await page.evaluate(() => {
       const hasUniversal = !!window.__UNIVERSAL_DATA_FOR_REHYDRATION__;
       const hasSigi = !!window.SIGI_STATE;
-      return { hasUniversal, hasSigi };
+      const ldJsonScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s => s.textContent);
+      return { hasUniversal, hasSigi, ldJsonScripts };
     });
-    console.log(`[${videoId}] window.__UNIVERSAL_DATA_FOR_REHYDRATION__ present: ${debugInfo.hasUniversal}, window.SIGI_STATE present: ${debugInfo.hasSigi}`);
+    console.log(`[${videoId}] window.__UNIVERSAL_DATA_FOR_REHYDRATION__ present: ${debugInfo.hasUniversal}, window.SIGI_STATE present: ${debugInfo.hasSigi}, ld+json blocks found: ${debugInfo.ldJsonScripts.length}`);
+
+    // Save everything to disk so we can inspect the real structure directly,
+    // instead of guessing at field names blind.
+    try{
+      if(!fs.existsSync('debug-data')) fs.mkdirSync('debug-data');
+      const state = await page.evaluate(() => window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null);
+      if(state) fs.writeFileSync(`debug-data/${videoId}-state.json`, JSON.stringify(state, null, 2));
+      if(debugInfo.ldJsonScripts.length){
+        fs.writeFileSync(`debug-data/${videoId}-ldjson.json`, debugInfo.ldJsonScripts.join('\n\n---\n\n'));
+      }
+    }catch(e){
+      console.warn(`[${videoId}] Could not save debug data:`, e.message);
+    }
+
+    // Check ld+json first — schema.org VideoObject markup often carries the
+    // view/like/comment counts even when the visible UI hides them from
+    // logged-out visitors.
+    for(const block of debugInfo.ldJsonScripts){
+      try{
+        const parsed = JSON.parse(block);
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        for(const item of items){
+          const stats = item.interactionStatistic;
+          if(stats){
+            const list = Array.isArray(stats) ? stats : [stats];
+            const viewStat = list.find(s => (s.interactionType || '').includes('WatchAction') || (s.interactionType || '').toLowerCase().includes('view'));
+            if(viewStat && viewStat.userInteractionCount){
+              const playCount = parseInt(viewStat.userInteractionCount, 10);
+              if(!isNaN(playCount)){
+                console.log(`[${videoId}] Found view count via ld+json schema: ${playCount.toLocaleString()}`);
+                return { id: videoId, playCount, url: videoUrl };
+              }
+            }
+          }
+        }
+      }catch(e){ /* not valid JSON, skip */ }
+    }
 
     const state = await page.evaluate(() => {
       return window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null;
@@ -121,7 +159,7 @@ async function checkVideo(browser, videoUrl){
 
     const match = items.get(videoId) || Array.from(items.values())[0];
     if(!match){
-      console.warn(`[${videoId}] No matching video stats object found in the embedded state.`);
+      console.warn(`[${videoId}] No matching video stats object found in the embedded state either. Check the debug-data artifact for the raw JSON.`);
       return null;
     }
 
