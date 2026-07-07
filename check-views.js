@@ -5,7 +5,9 @@
 // Tracked profiles and results now live in the same Firestore project as the
 // account tracker web app, scoped under your Firebase Auth UID.
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const admin = require('firebase-admin');
 
 const MILESTONES = [500, 1000, 5000, 10000];
@@ -63,7 +65,25 @@ async function scrapeProfile(browser, handle){
   );
   try{
     await page.goto(`https://www.tiktok.com/@${handle}`, { waitUntil: 'networkidle2', timeout: 60000 });
-    await wait(3000); // let client-side rendering settle
+    await wait(3500);
+
+    // TikTok sometimes shows "Something went wrong / please try again later" on the video
+    // grid specifically (profile info still loads fine). Retry a couple times, clicking
+    // its own Refresh button, before giving up.
+    for(let attempt = 0; attempt < 3; attempt++){
+      const hasError = await page.evaluate(() => document.body.innerText.includes('Something went wrong'));
+      if(!hasError) break;
+
+      console.log(`[@${handle}] Video grid errored (attempt ${attempt + 1}/3) — retrying...`);
+      const clicked = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const refreshBtn = btns.find(b => b.innerText && b.innerText.trim().toLowerCase() === 'refresh');
+        if(refreshBtn){ refreshBtn.click(); return true; }
+        return false;
+      });
+      if(!clicked) await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
+      await wait(4000 + attempt * 2000);
+    }
 
     const title = await page.title();
     const finalUrl = page.url();
