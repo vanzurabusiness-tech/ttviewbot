@@ -1,19 +1,19 @@
 // check-views.js
-// Checks specific TikTok video links (that you paste into the app's "Tracked videos"
-// panel) for their view counts, and sends a Telegram message the first time a video
-// crosses each milestone.
+// Checks specific TikTok video links (pasted into the app's "Tracked videos" panel)
+// for their view counts using Apify's TikTok Scraper (a paid third-party service
+// that handles the actual data extraction), and sends a Telegram message the first
+// time a video crosses each milestone.
 //
 // Tracked links and results live in the same Firestore project as the account
 // tracker web app, scoped under your Firebase Auth UID.
 
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
 const admin = require('firebase-admin');
 const fs = require('fs');
 
 const MILESTONES = [500, 1000, 5000, 10000];
 const UID = process.env.FIRESTORE_UID;
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
+const APIFY_ACTOR = 'clockworks~tiktok-scraper'; // "TikTok Scraper" by Clockworks on Apify
 
 // ---- Firebase init (uses a service account, bypasses client security rules) ----
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -22,8 +22,6 @@ const db = admin.firestore();
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function sendTelegram(text){
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
@@ -48,147 +46,75 @@ function extractVideoId(url){
   return m ? m[1] : null;
 }
 
-// Recursively search the page's embedded state for any object that looks like
-// a TikTok video item ({ id, stats.playCount }). Loose on purpose so small
-// schema changes on TikTok's side don't break it outright.
-function findVideoItems(obj, found = new Map(), depth = 0){
-  if(!obj || typeof obj !== 'object' || depth > 10) return found;
-  if(obj.id && obj.stats && typeof obj.stats.playCount === 'number'){
-    found.set(obj.id, { id: obj.id, playCount: obj.stats.playCount });
+async function fetchViewsViaApify(videoUrl){
+  if(!APIFY_TOKEN){
+    throw new Error('APIFY_TOKEN env var is missing. Set it as a GitHub Actions secret.');
   }
-  for(const key in obj){
-    if(Object.prototype.hasOwnProperty.call(obj, key)){
-      findVideoItems(obj[key], found, depth + 1);
-    }
-  }
-  return found;
-}
+  const endpoint = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      postURLs: [videoUrl],
+      shouldDownloadVideos: false,
+      shouldDownloadCovers: false,
+      shouldDownloadSubtitles: false,
+      shouldDownloadSlideshowImages: false
+    })
+  });
 
-async function checkVideo(browser, videoUrl){
-  const videoId = extractVideoId(videoUrl);
-  if(!videoId){
-    console.warn(`Could not parse a video ID out of: ${videoUrl}`);
+  if(!res.ok){
+    const text = await res.text();
+    throw new Error(`Apify request failed (${res.status}): ${text.slice(0, 300)}`);
+  }
+
+  const items = await res.json();
+
+  // Save the raw response for troubleshooting if the field names ever shift.
+  try{
+    if(!fs.existsSync('debug-data')) fs.mkdirSync('debug-data');
+    const videoId = extractVideoId(videoUrl) || 'unknown';
+    fs.writeFileSync(`debug-data/${videoId}-apify-response.json`, JSON.stringify(items, null, 2));
+  }catch(e){ /* non-fatal */ }
+
+  if(!items || items.length === 0){
+    console.warn(`Apify returned no items for ${videoUrl}`);
     return null;
   }
-
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 900 });
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
-  );
-  try{
-    await page.goto(videoUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-    await wait(3000);
-
-    const title = await page.title();
-    const finalUrl = page.url();
-    console.log(`[${videoId}] Page title: "${title}"`);
-    console.log(`[${videoId}] Final URL after load: ${finalUrl}`);
-
-    try{
-      if(!fs.existsSync('debug-screenshots')) fs.mkdirSync('debug-screenshots');
-      await page.screenshot({ path: `debug-screenshots/${videoId}.png` });
-    }catch(e){
-      console.warn(`[${videoId}] Could not save screenshot:`, e.message);
-    }
-
-    const blocked = await page.evaluate(() => {
-      const text = document.body.innerText || '';
-      return text.includes('Something went wrong') || text.includes('Drag the slider') || text.includes('Verify to continue');
-    });
-    if(blocked){
-      console.warn(`[${videoId}] Hit a CAPTCHA / block page — skipping, not attempting to solve it.`);
-      return null;
-    }
-
-    const debugInfo = await page.evaluate(() => {
-      const hasUniversal = !!window.__UNIVERSAL_DATA_FOR_REHYDRATION__;
-      const hasSigi = !!window.SIGI_STATE;
-      const ldJsonScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s => s.textContent);
-      return { hasUniversal, hasSigi, ldJsonScripts };
-    });
-    console.log(`[${videoId}] window.__UNIVERSAL_DATA_FOR_REHYDRATION__ present: ${debugInfo.hasUniversal}, window.SIGI_STATE present: ${debugInfo.hasSigi}, ld+json blocks found: ${debugInfo.ldJsonScripts.length}`);
-
-    // Save everything to disk so we can inspect the real structure directly,
-    // instead of guessing at field names blind.
-    try{
-      if(!fs.existsSync('debug-data')) fs.mkdirSync('debug-data');
-      const state = await page.evaluate(() => window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null);
-      if(state) fs.writeFileSync(`debug-data/${videoId}-state.json`, JSON.stringify(state, null, 2));
-      if(debugInfo.ldJsonScripts.length){
-        fs.writeFileSync(`debug-data/${videoId}-ldjson.json`, debugInfo.ldJsonScripts.join('\n\n---\n\n'));
-      }
-    }catch(e){
-      console.warn(`[${videoId}] Could not save debug data:`, e.message);
-    }
-
-    // Check ld+json first — schema.org VideoObject markup often carries the
-    // view/like/comment counts even when the visible UI hides them from
-    // logged-out visitors.
-    for(const block of debugInfo.ldJsonScripts){
-      try{
-        const parsed = JSON.parse(block);
-        const items = Array.isArray(parsed) ? parsed : [parsed];
-        for(const item of items){
-          const stats = item.interactionStatistic;
-          if(stats){
-            const list = Array.isArray(stats) ? stats : [stats];
-            const viewStat = list.find(s => (s.interactionType || '').includes('WatchAction') || (s.interactionType || '').toLowerCase().includes('view'));
-            if(viewStat && viewStat.userInteractionCount){
-              const playCount = parseInt(viewStat.userInteractionCount, 10);
-              if(!isNaN(playCount)){
-                console.log(`[${videoId}] Found view count via ld+json schema: ${playCount.toLocaleString()}`);
-                return { id: videoId, playCount, url: videoUrl };
-              }
-            }
-          }
-        }
-      }catch(e){ /* not valid JSON, skip */ }
-    }
-
-    const state = await page.evaluate(() => {
-      return window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null;
-    });
-    if(!state){
-      console.warn(`[${videoId}] No embedded state object found on the page at all.`);
-      return null;
-    }
-
-    const items = findVideoItems(state);
-    console.log(`[${videoId}] Scanned embedded state, found ${items.size} objects that look like video stats. IDs found: ${Array.from(items.keys()).join(', ') || '(none)'}`);
-
-    const match = items.get(videoId) || Array.from(items.values())[0];
-    if(!match){
-      console.warn(`[${videoId}] No matching video stats object found in the embedded state either. Check the debug-data artifact for the raw JSON.`);
-      return null;
-    }
-
-    console.log(`[${videoId}] ${match.playCount.toLocaleString()} views`);
-    return { id: videoId, playCount: match.playCount, url: videoUrl };
-  } finally {
-    await page.close();
+  const item = items[0];
+  if(item.errorCode){
+    console.warn(`Apify reported an error for ${videoUrl}: ${item.errorCode} ${item.errorMessage || ''}`);
+    return null;
   }
+  if(typeof item.playCount !== 'number'){
+    console.warn(`No numeric playCount in Apify result for ${videoUrl}. Keys present: ${Object.keys(item).join(', ')}`);
+    return null;
+  }
+  return item.playCount;
 }
 
 function newMilestonesCrossed(playCount, alreadyNotified){
   return MILESTONES.filter(m => playCount >= m && !alreadyNotified.includes(m));
 }
 
-async function processVideo(video){
-  const ref = db.collection('videoTracker').doc(UID).collection('videos').doc(video.id);
+async function processVideo(videoUrl, playCount){
+  const videoId = extractVideoId(videoUrl);
+  if(!videoId) return;
+
+  const ref = db.collection('videoTracker').doc(UID).collection('videos').doc(videoId);
   const snap = await ref.get();
   const prev = snap.exists ? snap.data() : { notifiedMilestones: [] };
   const already = prev.notifiedMilestones || [];
 
-  const toNotify = newMilestonesCrossed(video.playCount, already);
+  const toNotify = newMilestonesCrossed(playCount, already);
   for(const m of toNotify){
-    await sendTelegram(`${m.toLocaleString()} views on this video: ${video.url}`);
-    console.log(`Notified: ${video.url} hit ${m} views`);
+    await sendTelegram(`${m.toLocaleString()} views on this video: ${videoUrl}`);
+    console.log(`Notified: ${videoUrl} hit ${m} views`);
   }
 
   await ref.set({
-    url: video.url,
-    views: video.playCount,
+    url: videoUrl,
+    views: playCount,
     notifiedMilestones: [...already, ...toNotify],
     updatedAt: new Date().toISOString()
   }, { merge: true });
@@ -206,22 +132,18 @@ async function main(){
     return;
   }
 
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-
   for(const link of links){
     try{
-      console.log(`Checking ${link}...`);
-      const result = await checkVideo(browser, link);
-      if(result) await processVideo(result);
+      console.log(`Checking ${link} via Apify...`);
+      const views = await fetchViewsViaApify(link);
+      if(views !== null){
+        console.log(`${link} → ${views.toLocaleString()} views`);
+        await processVideo(link, views);
+      }
     }catch(e){
       console.error(`Error checking ${link}:`, e.message);
     }
   }
-
-  await browser.close();
 }
 
 main().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
