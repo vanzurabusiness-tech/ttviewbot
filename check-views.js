@@ -80,31 +80,48 @@ async function checkVideo(browser, videoUrl){
     await page.goto(videoUrl, { waitUntil: 'networkidle2', timeout: 60000 });
     await wait(3000);
 
+    const title = await page.title();
+    const finalUrl = page.url();
+    console.log(`[${videoId}] Page title: "${title}"`);
+    console.log(`[${videoId}] Final URL after load: ${finalUrl}`);
+
+    try{
+      if(!fs.existsSync('debug-screenshots')) fs.mkdirSync('debug-screenshots');
+      await page.screenshot({ path: `debug-screenshots/${videoId}.png` });
+    }catch(e){
+      console.warn(`[${videoId}] Could not save screenshot:`, e.message);
+    }
+
     const blocked = await page.evaluate(() => {
       const text = document.body.innerText || '';
       return text.includes('Something went wrong') || text.includes('Drag the slider') || text.includes('Verify to continue');
     });
     if(blocked){
       console.warn(`[${videoId}] Hit a CAPTCHA / block page — skipping, not attempting to solve it.`);
-      try{
-        if(!fs.existsSync('debug-screenshots')) fs.mkdirSync('debug-screenshots');
-        await page.screenshot({ path: `debug-screenshots/${videoId}.png` });
-      }catch(e){}
       return null;
     }
+
+    const debugInfo = await page.evaluate(() => {
+      const hasUniversal = !!window.__UNIVERSAL_DATA_FOR_REHYDRATION__;
+      const hasSigi = !!window.SIGI_STATE;
+      return { hasUniversal, hasSigi };
+    });
+    console.log(`[${videoId}] window.__UNIVERSAL_DATA_FOR_REHYDRATION__ present: ${debugInfo.hasUniversal}, window.SIGI_STATE present: ${debugInfo.hasSigi}`);
 
     const state = await page.evaluate(() => {
       return window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null;
     });
     if(!state){
-      console.warn(`[${videoId}] No embedded state found on the page.`);
+      console.warn(`[${videoId}] No embedded state object found on the page at all.`);
       return null;
     }
 
     const items = findVideoItems(state);
-    const match = items.get(videoId) || Array.from(items.values())[0]; // fall back to first item found
+    console.log(`[${videoId}] Scanned embedded state, found ${items.size} objects that look like video stats. IDs found: ${Array.from(items.keys()).join(', ') || '(none)'}`);
+
+    const match = items.get(videoId) || Array.from(items.values())[0];
     if(!match){
-      console.warn(`[${videoId}] Page loaded but no matching video stats found in it.`);
+      console.warn(`[${videoId}] No matching video stats object found in the embedded state.`);
       return null;
     }
 
