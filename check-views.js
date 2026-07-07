@@ -57,12 +57,26 @@ function findVideoItems(obj, found = new Map(), depth = 0){
 
 async function scrapeProfile(browser, handle){
   const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
   );
   try{
     await page.goto(`https://www.tiktok.com/@${handle}`, { waitUntil: 'networkidle2', timeout: 60000 });
     await wait(3000); // let client-side rendering settle
+
+    const title = await page.title();
+    const finalUrl = page.url();
+    console.log(`[@${handle}] Loaded page title: "${title}" at ${finalUrl}`);
+
+    // Save a screenshot so we can see exactly what the bot saw (CAPTCHA, block page, real content, etc.)
+    try{
+      const fs = require('fs');
+      if(!fs.existsSync('debug-screenshots')) fs.mkdirSync('debug-screenshots');
+      await page.screenshot({ path: `debug-screenshots/${handle}.png`, fullPage: false });
+    }catch(shotErr){
+      console.warn(`[@${handle}] Could not save debug screenshot:`, shotErr.message);
+    }
 
     const state = await page.evaluate(() => {
       return window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || window.SIGI_STATE || null;
@@ -74,6 +88,7 @@ async function scrapeProfile(browser, handle){
     }
 
     const items = findVideoItems(state);
+    console.log(`[@${handle}] Embedded state present, found ${items.size} matching video objects in it.`);
     return Array.from(items.values()).map(v => ({
       ...v,
       url: `https://www.tiktok.com/@${handle}/video/${v.id}`
@@ -141,4 +156,3 @@ async function main(){
 }
 
 main().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
-
